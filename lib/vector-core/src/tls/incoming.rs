@@ -12,7 +12,7 @@ use futures::{FutureExt, Stream, future::BoxFuture, stream};
 use ipnet::IpNet;
 use openssl::{
     ssl::{Ssl, SslAcceptor, SslMethod},
-    x509::X509,
+    x509::{X509, X509VerifyResult},
 };
 use snafu::ResultExt;
 use tokio::{
@@ -24,8 +24,8 @@ use tokio_openssl::SslStream;
 use tonic::transport::{Certificate, server::Connected};
 
 use super::{
-    CreateAcceptorSnafu, HandshakeSnafu, IncomingListenerSnafu, MaybeTlsSettings, MaybeTlsStream,
-    SslBuildSnafu, TcpBindSnafu, TlsAcceptorReloader, TlsError, TlsSettings,
+    CreateAcceptorSnafu, IncomingListenerSnafu, MaybeTlsSettings, MaybeTlsStream, SslBuildSnafu,
+    TcpBindSnafu, TlsAcceptorReloader, TlsError, TlsSettings,
 };
 use crate::tcp::{self, TcpKeepaliveConfig};
 
@@ -286,10 +286,16 @@ impl MaybeTlsIncomingStream<TcpStream> {
                 async move {
                     let ssl = Ssl::new(acceptor.context()).context(SslBuildSnafu)?;
                     let mut stream = SslStream::new(ssl, stream).context(SslBuildSnafu)?;
-                    Pin::new(&mut stream)
-                        .accept()
-                        .await
-                        .context(HandshakeSnafu)?;
+                    if let Err(source) = Pin::new(&mut stream).accept().await {
+                        // The error itself only says verification failed; the verify result says why.
+                        let reason = stream.ssl().verify_result();
+                        let error = if reason == X509VerifyResult::OK {
+                            TlsError::Handshake { source }
+                        } else {
+                            TlsError::PeerCertificateRejected { source, reason }
+                        };
+                        return Err(error);
+                    }
                     Ok(stream)
                 }
                 .boxed(),
